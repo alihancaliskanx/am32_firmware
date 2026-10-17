@@ -1,32 +1,76 @@
 # am32_firmware
 
-Bench setup for configuring and flashing an AM32 ESC (AT32F421, e.g. M4 70A 8S) from Linux, using an Arduino Uno as a USB-to-1-wire bridge instead of a flight controller.
+Bench setup for flashing an AM32 ESC (AT32F421) from Linux without a flight controller, using a NUCLEO-F446RE or an Arduino Uno as a USB-to-1-wire bridge.
 
 ## Contents
 
 | Path | Description |
 | :--- | :--- |
+| `stm32_bridge/` | 1-wire bridge firmware for a NUCLEO-F446RE, signal on D2 (PA10) |
+| `tools/flash_direct.py` | Flashes an AM32 hex through the bridge and verifies it |
 | `Arduino_AM32_pin3Link/` | 1-wire bridge sketch for the Uno, signal on D3 |
-| `firmware/AM32_AORC_G_A_F421_2.20.hex` | AM32 2.20, target `AORC_G_A_F421` |
+| `firmware/AM32_AORC_K_A_F421_2.21.hex` | AM32 2.21, target `AORC_K_A_F421` |
 | `firmware/AM32_AORC_K_A_F421_2.20.hex` | AM32 2.20, target `AORC_K_A_F421` |
+| `firmware/AM32_AORC_G_A_F421_2.20.hex` | AM32 2.20, target `AORC_G_A_F421` |
 
 ## Hardware
 
-- Arduino Uno or clone (ATmega328P; CH340 clones show up as `/dev/ttyUSB0`)
-- AM32 ESC
+- NUCLEO-F446RE; its ST-LINK/V2-1 shows up as `/dev/ttyACM0`. Alternatively an Arduino Uno or clone (CH340 clones show up as `/dev/ttyUSB0`).
+- AM32 ESC. Tested with an Aocoda-RC 70A/80A 3-8S single ESC, target `AORC_K_A_F421`.
 - LiPo battery for the ESC. The ESC MCU is not powered over the signal wire, so nothing responds without it.
 
-| ESC lead | Connect to |
-| :--- | :--- |
-| Signal (white / yellow) | Uno D3 |
-| Signal ground (black / brown) | Uno GND |
-| Battery + / - | LiPo |
+| ESC lead | NUCLEO-F446RE | Arduino Uno |
+| :--- | :--- | :--- |
+| Signal (white / yellow) | D2 (PA10) | D3 |
+| Signal ground (black / brown) | GND | GND |
+| Battery + / - | LiPo | LiPo |
 
-## The bridge
+## STM32 bridge
 
-`Arduino_AM32_pin3Link.ino` disables the hardware UART and mirrors the USB serial RX/TX lines onto a single 1-wire pin. It implements no protocol and does not care about baud rate; the configurator talks to the ESC bootloader directly.
+`stm32_bridge` is bare-metal firmware. It uses the ST-LINK virtual COM port pins (PA2/PA3, connected by default on the Nucleo) as plain GPIO and mirrors them onto the ESC signal pin, so it does not depend on the baud rate.
 
-The pin is chosen at compile time with `#define OW_PIND3` (D3). `OW_PINB3` (D11) and `OW_PINB2` (D51 on a Mega) are also available.
+While the host is silent the bridge drives the signal pin high (push-pull). At power-up the AM32 bootloader samples the pin with its own pull-down enabled and stays in the bootloader only if it never reads low; a weak pull-up such as the Uno's can lose that. Host activity releases the pin to an input with pull-up so the ESC can answer, and 500 ms of silence drives it high again. LD2 is lit while the pin is held high.
+
+Build with the GNU Arm toolchain (`arm-none-eabi-gcc`):
+
+```bash
+make -C stm32_bridge
+```
+
+Flash the board by copying `stm32_bridge/bridge.bin` to the ST-LINK USB drive (`NOD_F446RE` or `NODE_F446RE`). The board restarts into the bridge when the copy finishes.
+
+With the bridge running, connect the ESC battery: the ESC stays in the bootloader and does not beep.
+
+## Flashing the ESC
+
+`tools/flash_direct.py` needs Python 3 and pyserial. It talks to the AM32 bootloader through the bridge with the same command sequence as the AM32 configurator's direct-connect mode:
+
+1. Checks that the bootloader reports the 32 KB F421 signature and that the target name stored on the ESC matches the one in the hex file.
+2. Saves the 184-byte settings block to the `--backup` file.
+3. Clears the settings boot byte, so an interrupted flash cannot start a half-written image.
+4. Writes the image from 0x1000 in 64-byte chunks.
+5. Reads the whole image back and compares it.
+6. Writes the settings back with the boot byte set, then starts the firmware.
+
+Close every other program that has the port open (`fuser -v /dev/ttyACM0`). Check the target without writing anything:
+
+```bash
+python3 tools/flash_direct.py /dev/ttyACM0 firmware/AM32_AORC_K_A_F421_2.21.hex --backup eeprom_backup.bin --dry-run
+```
+
+Flash:
+
+```bash
+python3 tools/flash_direct.py /dev/ttyACM0 firmware/AM32_AORC_K_A_F421_2.21.hex --backup eeprom_backup.bin
+```
+
+A flash takes about 40 seconds. If it fails, the boot byte stays cleared and the ESC remains in the bootloader; run the command again. The bootloader itself is never written.
+
+After the update the ESC plays its startup tune once, finds no throttle signal, restarts, and stays in the bootloader because the bridge holds the line high. AM32 2.21 converts a layout 2 settings block to layout 4 on its first start; fields that layout 2 did not have get default values.
+
+## Arduino bridge
+
+`Arduino_AM32_pin3Link.ino` disables the hardware UART and mirrors the USB serial RX/TX lines onto a single 1-wire pin. The pin is chosen at compile time with `#define OW_PIND3` (D3). `OW_PINB3` (D11) and `OW_PINB2` (D51 on a Mega) are also available.
 
 Build and upload with [arduino-cli](https://arduino.github.io/arduino-cli/):
 
@@ -34,29 +78,20 @@ Build and upload with [arduino-cli](https://arduino.github.io/arduino-cli/):
 arduino-cli compile --fqbn arduino:avr:uno --upload -p /dev/ttyUSB0 Arduino_AM32_pin3Link
 ```
 
-## Configuring and flashing the ESC
-
-1. Close anything else that has the serial port open (`fuser -v /dev/ttyUSB0`).
-2. Connect the LiPo to the ESC.
-3. Open https://am32.ca/configurator in a browser with WebSerial support (Chromium, Chrome).
-4. Choose **Direct Connect**, not flight controller passthrough.
-5. Select the serial port and connect.
-6. Read the settings and note the target name the ESC reports.
-7. Flash the hex file whose target matches. The two targets have different pin mappings; flashing the wrong one can damage the ESC.
+The sketch echoes the host's low bits without reading the signal pin, so a clean echo does not prove that the pin works. On the Uno used here, D3 was stuck high, and the ESC never answered through it.
 
 ## What does not work with this setup
 
 | Approach | Result |
 | :--- | :--- |
 | ArduPilot passthrough on a CubeOrange+ with `esc-configurator.com` | `Could not enable 4 way interface - reconnect flight controller`; MSP reports `MOTOR COUNT: 0` |
-| This bridge with the BLHeliSuite desktop tool (`Esc_Config_Tool_1_82_Linux`) | `Didn't connect M1` |
+| Arduino bridge with the BLHeliSuite desktop tool (`Esc_Config_Tool_1_82_Linux`) | `Didn't connect M1` |
 | BLHeli 4-way interface firmware on the Uno (`4wArduino_m328P_16_MULTIv20006.hex`), signal on D11 | No reply to the 4-way init command at 19200 to 115200 baud |
-
-The 4-way firmware replaces the bridge on the Uno only. Re-upload the sketch and move the signal wire back to D3 to recover.
+| https://am32.ca/configurator Direct Connect through the STM32 bridge | Connects, but Read shows no ESC; Flash then does nothing and looks for `AM32_ERROR_<version>.hex`. `tools/flash_direct.py` works over the same link |
 
 ## Beeping on power-up
 
-Continuous beeping after the battery is connected means the ESC did not see a bootloader handshake, started the normal firmware, and is waiting for a throttle signal. It is not a fault.
+Continuous beeping after the battery is connected means the ESC is running its firmware without a throttle signal: it restarts every two seconds and plays the startup tune each time. It did not stay in the bootloader because the signal pin was not held high at power-up. It is not a fault.
 
 ## License
 
