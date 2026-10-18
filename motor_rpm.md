@@ -178,3 +178,135 @@ RPM shows up in MAVLink `ESC_TELEMETRY_1_TO_4`, in the dataflash `ESC` messages,
 ## Cube Orange+ state on 2026-10-17
 
 Read over MAVLink, before any change: ArduSub V4.7.0 (`7086516a`), `CubeOrangePlus-bdshot`, `FRAME_CONFIG` 1 (6 thrusters on MAIN 1-6), `MOT_PWM_TYPE` 0, `MOT_PWM_MIN`/`MAX` 1100/1900, AUX 1 lights (181), AUX 2 camera tilt (7), `SERVO_BLH_POLES` 14, `SERVO_DSHOT_ESC` 0, `BRD_IO_DSHOT` 0. With these settings the ESC already works over PWM on a MAIN output, without RPM.
+
+## ArduSub needs `SERVO_BLH_MASK` and `SERVO_BLH_OTYPE`
+
+`AP_BLHeli::init` takes the motor mask from `AP_Motors` only in Copter, Plane and Rover builds; `SERVO_BLH_AUTO` does not exist in Sub (`libraries/AP_BLHeli/AP_BLHeli.cpp:73`, `:1464-1481`). `SRV_Channels::init` is called with an empty mask (`libraries/AP_Vehicle/AP_Vehicle.cpp:452`), so in ArduSub the digital output mask is built only from `SERVO_BLH_MASK` with the type in `SERVO_BLH_OTYPE`. With `MOT_PWM_TYPE` alone the outputs do send DShot, but:
+
+| Missing | Effect |
+| :--- | :--- |
+| Digital mask is 0 | No serial telemetry requests (`num_motors` 0), `MOT_PWM_MIN`/`MAX` stay 1100/1900 |
+| `SERVO_BLH_3DMASK & digital_mask` is 0 | 3D (reversible) DShot mapping is not applied (`AP_BLHeli.cpp:1489`) |
+| `SERVO_BLH_BDMASK & digital_mask` is 0 | Bidirectional DShot is not enabled (`AP_BLHeli.cpp:1495`) |
+
+The parameter blocks in the Cube and X7 layouts above therefore also need these two lines. On the X7 with motors on outputs 1-8:
+
+```
+SERVO_BLH_MASK 255
+SERVO_BLH_OTYPE 5
+```
+
+A non-zero `SERVO_BLH_MASK` also installs the BLHeli pass-through handler on the MAVLink port in `SERVO_BLH_PORT`; it does nothing until a configurator talks to it.
+
+## X7: serial telemetry from several ESCs on one UART
+
+| Fact | Source |
+| :--- | :--- |
+| ArduPilot uses one UART for ESC telemetry, the first port with protocol 16. A second port with 16 is ignored. | `AP_BLHeli.cpp:1515` |
+| It asks one ESC at a time, by setting the telemetry bit in that ESC's next DShot frame, and assigns the 10-byte reply to that ESC | `AP_BLHeli.cpp:1678-1691`, `:1545`, `libraries/AP_HAL_ChibiOS/RCOutput.cpp:1734-1745` |
+| Requests go round robin to every digital motor, including the ones that also have bidirectional DShot | `AP_BLHeli.cpp:1680-1686` |
+| Request interval is `1/(SERVO_BLH_TRATE x motors)`, at least 2 ms. With 8 motors each ESC gets at most 62.5 Hz. The default `TRATE` of 10 gives 10 Hz per ESC. | `AP_BLHeli.cpp:1637-1641` |
+| More than 10 bytes waiting means two ESCs answered; everything is discarded | `AP_BLHeli.cpp:1650-1654` |
+| Requests are also sent while disarmed (throttle value 0 with the telemetry bit) | `RCOutput.cpp:1728-1740` |
+| AM32 answers only when the telemetry bit is set; it never sends on its own while `INTERVAL_TELEMETRY` is 0 | AM32 v2.21 `Src/dshot.c:106-108` |
+| AM32 runs the telemetry USART in single-wire half-duplex mode with the internal pull-up on, so the pin is released between replies | AM32 v2.21 `Mcu/f421/Src/serial_telemetry.c:28-32`, `:59` |
+| `AORC_K_A_F421` is built with `USE_SERIAL_TELEMETRY` | AM32 v2.21 `Inc/targets.h` |
+| Packet: temperature, voltage, current, consumption, eRPM/100, CRC8. RPM = value x 200 / poles, about 7.1 rpm per step with 28 poles. | `AP_BLHeli.cpp:1544-1555` |
+
+The ESC telemetry pads can therefore share one RX pin: only the requested ESC drives the line, and a 10-byte reply at 115200 baud (about 0.9 ms) fits inside the 2 ms gap. The FC TX pin of that UART is not used.
+
+X7 serial ports (`libraries/AP_HAL_ChibiOS/hwdef/CUAV-X7/hwdef.dat:22`): SERIAL1 TELEM1, SERIAL2 TELEM2, SERIAL3 GPS1, SERIAL4 GPS2, SERIAL5 UART8, SERIAL6 UART7 (debug).
+
+### Wiring
+
+- Every ESC `T` pad to the RX pin of one free UART, each through a 470 ohm to 1 kohm series resistor, so that a pin driven at the wrong time cannot short against another ESC.
+- ESC signal ground to FC ground. Keep the telemetry leads short and away from the motor phase wires.
+- Not checked: whether the Aocoda single ESC brings PB6 out to a pad, and whether the AT32F421 really releases the pin in half-duplex mode as the STM32 does. Check with a logic analyser on two ESCs before wiring all of them.
+
+### Two layouts compared
+
+| | A: all 8 on serial telemetry | B: 1-4 bidirectional DShot, 5-8 serial telemetry |
+| :--- | :--- | :--- |
+| Firmware | Standard `CUAV-X7` build | `CUAV-X7-bdshot` build |
+| Extra wiring | 8 telemetry leads to one RX pin | 4 telemetry leads (or 8, see below) |
+| Signal wire | One-way DShot | Outputs 1-4 become two-way: the ESC answers on the signal wire after each frame. More sensitive to lead length and noise; `SERVO_DSHOT_RATE` and DShot300 help. |
+| RPM rate, horizontal 1-4 | At most 62.5 Hz | One reply per DShot frame, at the output rate (loop rate 400 Hz or more) |
+| RPM rate, vertical 5-8 | At most 62.5 Hz | At most 62.5 Hz. Requests still go to 1-4 as well, so the rate for 5-8 does not go up. |
+| RPM resolution | 100 eRPM, about 7 rpm | 1-4: from the eRPM period, finer at low speed; 5-8: about 7 rpm |
+| RPM latency | Up to 16 ms between samples plus about 1 ms transfer | 1-4: one frame; 5-8: as in A |
+| Bus load | 500 packets/s x 10 bytes, about 43 % of 115200 baud | Same serial load. The signal wires of 1-4 add the reply after every frame. |
+| Temperature, voltage, current, mAh | All 8 | Only ESCs whose `T` pad is wired. Wiring 1-4 too costs nothing in rate and gives them as well. |
+| Data quality | — | `get_erpm_error_rate` reports bad bidirectional frames per motor |
+| Single point of failure | One bus for all 8. An ESC that holds the line low (fault, or an unpowered MCU clamping through its protection diode) cuts telemetry from all 8. | RPM of 1-4 does not depend on the shared bus |
+| Sign | None. Direction comes from the commanded output in both layouts. | Same |
+
+If the `T` pads of 1-4 are wired in layout B, serial and bidirectional values both go to `update_rpm` for the same motor (`AP_BLHeli.cpp:1548`, `libraries/AP_HAL_ChibiOS/RCOutput_bdshot.cpp:860`). The values agree, but the reported `update_rate_hz` jumps between the two sources.
+
+### Parameters for layout B on the X7
+
+```
+FRAME_CONFIG 2
+SERVO1_FUNCTION 33
+SERVO2_FUNCTION 34
+SERVO3_FUNCTION 35
+SERVO4_FUNCTION 36
+SERVO5_FUNCTION 37
+SERVO6_FUNCTION 38
+SERVO7_FUNCTION 39
+SERVO8_FUNCTION 40
+SERVO13_FUNCTION 181
+SERVO14_FUNCTION 7
+MOT_PWM_TYPE 5
+SERVO_BLH_MASK 255
+SERVO_BLH_OTYPE 5
+SERVO_BLH_BDMASK 15
+SERVO_BLH_3DMASK 255
+SERVO_BLH_POLES 28
+SERVO_BLH_TRATE 60
+SERVO_DSHOT_ESC 1
+SERIAL4_PROTOCOL 16
+SERIAL4_BAUD 115
+```
+
+`SERIAL4` (GPS2) is an example; use any free port. For layout A, use the standard build and drop `SERVO_BLH_BDMASK`. On the ESC side nothing changes: `INTERVAL_TELEMETRY` stays 0.
+
+A separate microcontroller that collects the telemetry is not needed. ArduPilot does not take ESC telemetry over MAVLink, and the microcontroller could not set the request bit because the signal wires belong to the FC.
+
+## Decision (2026-10-17): layout A on the CUAV X7+ Pro
+
+All eight thrusters report through AM32 serial telemetry on one shared UART. Bidirectional DShot is not used, so the standard `CUAV-X7` build is enough. Expected: RPM, temperature, voltage, current and consumption for every thruster at up to 62.5 Hz each, RPM in steps of about 7 rpm, no sign.
+
+| Output | Connected to |
+| :--- | :--- |
+| 1-8 | Motors 1-8, DShot300, 3D |
+| 13 / 14 | Lights / camera tilt (PWM) |
+| RX of one free UART | `T` pads of all eight ESCs, each through 470 ohm to 1 kohm |
+
+```
+FRAME_CONFIG 2
+SERVO1_FUNCTION 33
+SERVO2_FUNCTION 34
+SERVO3_FUNCTION 35
+SERVO4_FUNCTION 36
+SERVO5_FUNCTION 37
+SERVO6_FUNCTION 38
+SERVO7_FUNCTION 39
+SERVO8_FUNCTION 40
+SERVO13_FUNCTION 181
+SERVO14_FUNCTION 7
+MOT_PWM_TYPE 5
+SERVO_BLH_MASK 255
+SERVO_BLH_OTYPE 5
+SERVO_BLH_3DMASK 255
+SERVO_BLH_POLES 28
+SERVO_BLH_TRATE 63
+SERVO_DSHOT_ESC 1
+SERIAL4_PROTOCOL 16
+SERIAL4_BAUD 115
+```
+
+`SERVO_BLH_TRATE` 63 or more hits the 2 ms floor (62.5 Hz per ESC). Confirmed by the user: the Aocoda ESC has a `T` pad, and GPS1 (SERIAL3) and GPS2 (SERIAL4) are free on the vehicle. Both are `NODMA` UARTs, which is fine for 115200 baud receive. Open points: the half-duplex release on the AT32F421 (test below) and how a dead ESC on the shared line shows up in the log. This is also a fault case for the thesis: all eight telemetry streams stopping together points to the bus, not to the thrusters.
+
+Release test for one powered, idle ESC: 10 kohm from the `T` pad to ground, measure the pad voltage. About 3.3 V means the pin is driven high between replies (push-pull); well under 1 V means it is released and only the internal pull-up (roughly 40 kohm) holds it. If it is driven, use a Schottky diode per ESC instead of the resistor (cathode at the `T` pad, anode on the shared line) and a 10 kohm pull-up from the line to 3.3 V: an ESC can then only pull the line low, which is all a UART needs. The diode version works in both cases.
+
+Result (2026-10-17): invalid. The user measured below 1 V with 1 kohm, but the ESC was not beeping, so it was most likely in the bootloader, where the telemetry pin is not set up and floats; a floating pin also reads near 0 V. AM32 sets up the telemetry USART only at firmware start (`Mcu/f421/Src/peripherals.c:38-40`). Repeat with the bridge disconnected and the signal wire left open or tied to ground, so the ESC boots its firmware and beeps. With 1 kohm instead of 10 kohm a driven pin reads about 3.2 V and a released one about 0.1 V, so 1 kohm is fine for the test.

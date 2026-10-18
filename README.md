@@ -1,6 +1,6 @@
 # am32_firmware
 
-Bench setup for flashing an AM32 ESC (AT32F421) from Linux without a flight controller, using a NUCLEO-F446RE or an Arduino Uno as a USB-to-1-wire bridge.
+Bench setup for flashing and configuring an AM32 ESC (AT32F421) from Linux without a flight controller, using a NUCLEO-F446RE or an Arduino Uno as a USB-to-1-wire bridge. `motor_rpm.md` covers getting thruster RPM from these ESCs into ArduSub.
 
 ## Contents
 
@@ -9,6 +9,7 @@ Bench setup for flashing an AM32 ESC (AT32F421) from Linux without a flight cont
 | `stm32_bridge/` | 1-wire bridge firmware for a NUCLEO-F446RE, signal on D2 (PA10) |
 | `tools/flash_direct.py` | Flashes an AM32 hex through the bridge and verifies it |
 | `Arduino_AM32_pin3Link/` | 1-wire bridge sketch for the Uno, signal on D3 |
+| `motor_rpm.md` | Thruster RPM feedback in ArduSub on a Cube Orange+ or CUAV X7+ Pro: output limits, telemetry options, parameters |
 | `firmware/AM32_AORC_K_A_F421_2.21.hex` | AM32 2.21, target `AORC_K_A_F421` |
 | `firmware/AM32_AORC_K_A_F421_2.20.hex` | AM32 2.20, target `AORC_K_A_F421` |
 | `firmware/AM32_AORC_G_A_F421_2.20.hex` | AM32 2.20, target `AORC_G_A_F421` |
@@ -68,6 +69,19 @@ A flash takes about 40 seconds. If it fails, the boot byte stays cleared and the
 
 After the update the ESC plays its startup tune once, finds no throttle signal, restarts, and stays in the bootloader because the bridge holds the line high. AM32 2.21 converts a layout 2 settings block to layout 4 on its first start; fields that layout 2 did not have get default values.
 
+## Configuring the ESC
+
+The AM32 configurator works through the STM32 bridge:
+
+1. Close every other program that has the port open (`fuser -v /dev/ttyACM0`).
+2. Open https://am32.ca/configurator in a new Chromium tab.
+3. Select the ST-LINK port (`0x0483:0x374b`), tick **Direct**, keep 19200 baud and connect. The ST-LINK vendor ID is not on the configurator's list of direct-connect adapters, so the box has to be ticked by hand.
+4. The configurator reads the ESC on connect. Click the ESC card to show its settings.
+
+The first attempts, with AM32 2.17 still on the ESC, showed no ESC card, and Flash then looked for a file named `AM32_ERROR_<version>.hex`. After the update to 2.21, in a new tab, the ESC card appeared and the settings could be read and saved to a file. Writing settings back has not been confirmed. The cause of the earlier failure was not found. If it happens again, reload the page and reconnect; `tools/flash_direct.py` does not depend on the configurator.
+
+Flashing from the configurator through the bridge has not been tried; the update to 2.21 was done with `tools/flash_direct.py`.
+
 ## Arduino bridge
 
 `Arduino_AM32_pin3Link.ino` disables the hardware UART and mirrors the USB serial RX/TX lines onto a single 1-wire pin. The pin is chosen at compile time with `#define OW_PIND3` (D3). `OW_PINB3` (D11) and `OW_PINB2` (D51 on a Mega) are also available.
@@ -87,7 +101,6 @@ The sketch echoes the host's low bits without reading the signal pin, so a clean
 | ArduPilot passthrough on a CubeOrange+ with `esc-configurator.com` | `Could not enable 4 way interface - reconnect flight controller`; MSP reports `MOTOR COUNT: 0` |
 | Arduino bridge with the BLHeliSuite desktop tool (`Esc_Config_Tool_1_82_Linux`) | `Didn't connect M1` |
 | BLHeli 4-way interface firmware on the Uno (`4wArduino_m328P_16_MULTIv20006.hex`), signal on D11 | No reply to the 4-way init command at 19200 to 115200 baud |
-| https://am32.ca/configurator Direct Connect through the STM32 bridge | Connects, but Read shows no ESC; Flash then does nothing and looks for `AM32_ERROR_<version>.hex`. `tools/flash_direct.py` works over the same link |
 
 ## Beeping on power-up
 
